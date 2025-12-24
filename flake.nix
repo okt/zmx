@@ -6,11 +6,15 @@
   };
 
   outputs =
-    { zig2nix, ... }:
+    { self, zig2nix, ... }:
     let
       flake-utils = zig2nix.inputs.flake-utils;
+      supportedSystems = [
+        "x86_64-linux"
+        "aarch64-linux"
+      ];
     in
-    (flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (
+    (flake-utils.lib.eachSystem supportedSystems (
       system:
       let
         env = zig2nix.outputs.zig-env.${system} {
@@ -47,8 +51,30 @@
           test = env.app [ ] "zig build test -- \"$@\"";
         };
 
-        devShells.default = env.mkShell {
-        };
+        devShells.default = env.mkShell { };
       }
-    ));
+    ))
+    // {
+      # NixOS module
+      nixosModules = {
+        zmx =
+          { pkgs, ... }:
+          {
+            imports = [ ./nix/modules/nixos.nix ];
+            programs.zmx.package = self.packages.${pkgs.stdenv.hostPlatform.system}.zmx;
+          };
+        default = self.nixosModules.zmx;
+      };
+
+      # Home-Manager module
+      homeManagerModules = {
+        zmx =
+          { pkgs, ... }:
+          {
+            imports = [ ./nix/modules/home-manager.nix ];
+            programs.zmx.package = self.packages.${pkgs.stdenv.hostPlatform.system}.zmx;
+          };
+        default = self.homeManagerModules.zmx;
+      };
+    };
 }
