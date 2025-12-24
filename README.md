@@ -34,6 +34,52 @@ brew tap neurosnap/tap
 brew install zmx
 ```
 
+### nix
+
+Run directly without installing:
+
+```bash
+nix run github:neurosnap/zmx
+```
+
+#### NixOS module
+
+```nix
+# flake.nix
+{
+  inputs.zmx.url = "github:neurosnap/zmx";
+}
+
+# configuration.nix
+{ inputs, ... }:
+{
+  imports = [ inputs.zmx.nixosModules.default ];
+  programs.zmx.enable = true;
+}
+```
+
+#### Home-Manager module
+
+```nix
+# flake.nix
+{
+  inputs.zmx.url = "github:neurosnap/zmx";
+}
+
+# home.nix
+{ inputs, ... }:
+{
+  imports = [ inputs.zmx.homeManagerModules.default ];
+  programs.zmx.enable = true;
+}
+```
+
+#### Development shell
+
+```bash
+nix develop github:neurosnap/zmx
+```
+
 ### src
 
 - Requires zig `v0.15`
