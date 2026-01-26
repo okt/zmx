@@ -103,7 +103,8 @@ Commands:
   [a]ttach <name> [command...]   Attach to session, creating session if needed
   [r]un <name> [command...]      Send command without attaching, creating session if needed
   [d]etach                       Detach all clients from current session  (ctrl+\ for current client)
-  [l]ist                         List active sessions
+  [l]ist [--short]               List active sessions
+  [c]ompletions <shell>          Completion scripts for shell integration (bash, zsh, or fish)
   [k]ill <name>                  Kill a session and all attached clients
   [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
   [v]ersion                      Show version information
@@ -180,6 +181,45 @@ POWERLEVEL9K_RIGHT_PROMPT_ELEMENTS+=my_zmx_session
    background = 'p:black'
    type = 'text'
    style = 'plain'
+```
+
+## shell completion
+
+Shell auto-completion for `zmx` commands and session names can be enabled using the `completions` subcommand. Once configured, you'll get auto-complete for both local `zmx` commands and sessions:
+
+```bash
+ssh remote-server zmx attach session-na<TAB>
+# <- auto-complete suggestions appear here
+```
+
+### bash
+
+Add this to your `.bashrc` file:
+
+```bash
+if command -v zmx &> /dev/null; then
+  eval "$(zmx completions bash)"
+fi
+```
+
+### zsh
+
+Add this to your `.zshrc` file:
+
+```zsh
+if command -v zmx &> /dev/null; then
+  eval "$(zmx completions zsh)"
+fi
+```
+
+### fish
+
+Add this to your `.config/fish/config.fish` file:
+
+```fish
+if type -q zmx
+  zmx completions fish | source
+end
 ```
 
 ## philosophy

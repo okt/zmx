@@ -5,8 +5,10 @@ const build_options = @import("build_options");
 const ghostty_vt = @import("ghostty-vt");
 const ipc = @import("ipc.zig");
 const log = @import("log.zig");
+const completions = @import("completions.zig");
 
 pub const version = build_options.version;
+pub const git_sha = build_options.git_sha;
 pub const ghostty_version = build_options.ghostty_version;
 
 var log_system = log.LogSystem{};
@@ -55,6 +57,7 @@ else
     c.forkpty;
 
 var sigwinch_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
+var sigterm_received: std.atomic.Value(bool) = std.atomic.Value(bool).init(false);
 
 const Client = struct {
     alloc: std.mem.Allocator,
@@ -127,6 +130,7 @@ const Daemon = struct {
     running: bool,
     pid: i32,
     command: ?[]const []const u8 = null,
+    cwd: []const u8 = "",
     has_pty_output: bool = false,
     has_had_client: bool = false,
 
@@ -241,17 +245,53 @@ const Daemon = struct {
 
     pub fn handleKill(self: *Daemon) void {
         std.log.info("kill received session={s}", .{self.session_name});
-        posix.kill(self.pid, posix.SIG.TERM) catch |err| {
-            std.log.warn("failed to send SIGTERM to pty child err={s}", .{@errorName(err)});
-        };
         self.shutdown();
+        // gracefully shutdown shell processes, shells tend to ignore SIGTERM so we send SIGHUP instead
+        //   https://www.gnu.org/software/bash/manual/html_node/Signals.html
+        // negative pid means kill process and children
+        std.log.info("sending SIGHUP session={s} pid={d}", .{ self.session_name, self.pid });
+        posix.kill(-self.pid, posix.SIG.HUP) catch |err| {
+            std.log.warn("failed to send SIGHUP to pty child err={s}", .{@errorName(err)});
+        };
+        std.Thread.sleep(500 * std.time.ns_per_ms);
+        posix.kill(-self.pid, posix.SIG.KILL) catch |err| {
+            std.log.warn("failed to send SIGKILL to pty child err={s}", .{@errorName(err)});
+        };
     }
 
     pub fn handleInfo(self: *Daemon, client: *Client) !void {
         const clients_len = self.clients.items.len - 1;
+
+        // Build command string from args
+        var cmd_buf: [ipc.MAX_CMD_LEN]u8 = undefined;
+        var cmd_len: u16 = 0;
+        if (self.command) |args| {
+            for (args, 0..) |arg, i| {
+                if (i > 0) {
+                    if (cmd_len < ipc.MAX_CMD_LEN) {
+                        cmd_buf[cmd_len] = ' ';
+                        cmd_len += 1;
+                    }
+                }
+                const remaining = ipc.MAX_CMD_LEN - cmd_len;
+                const copy_len: u16 = @intCast(@min(arg.len, remaining));
+                @memcpy(cmd_buf[cmd_len..][0..copy_len], arg[0..copy_len]);
+                cmd_len += copy_len;
+            }
+        }
+
+        // Copy cwd
+        var cwd_buf: [ipc.MAX_CWD_LEN]u8 = undefined;
+        const cwd_len: u16 = @intCast(@min(self.cwd.len, ipc.MAX_CWD_LEN));
+        @memcpy(cwd_buf[0..cwd_len], self.cwd[0..cwd_len]);
+
         const info = ipc.Info{
             .clients_len = clients_len,
             .pid = self.pid,
+            .cmd_len = cmd_len,
+            .cwd_len = cwd_len,
+            .cmd = cmd_buf,
+            .cwd = cwd_buf,
         };
         try ipc.appendMessage(self.alloc, &client.write_buf, .Info, std.mem.asBytes(&info));
         client.has_pending_output = true;
@@ -300,7 +340,7 @@ pub fn main() !void {
     defer log_system.deinit();
 
     const cmd = args.next() orelse {
-        return list(&cfg);
+        return list(&cfg, false);
     };
 
     if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "v") or std.mem.eql(u8, cmd, "-v") or std.mem.eql(u8, cmd, "--version")) {
@@ -308,7 +348,12 @@ pub fn main() !void {
     } else if (std.mem.eql(u8, cmd, "help") or std.mem.eql(u8, cmd, "h") or std.mem.eql(u8, cmd, "-h")) {
         return help();
     } else if (std.mem.eql(u8, cmd, "list") or std.mem.eql(u8, cmd, "l")) {
-        return list(&cfg);
+        const short = if (args.next()) |arg| std.mem.eql(u8, arg, "--short") else false;
+        return list(&cfg, short);
+    } else if (std.mem.eql(u8, cmd, "completions") or std.mem.eql(u8, cmd, "c")) {
+        const arg = args.next() orelse return;
+        const shell = completions.Shell.fromString(arg) orelse return;
+        return printCompletions(shell);
     } else if (std.mem.eql(u8, cmd, "detach") or std.mem.eql(u8, cmd, "d")) {
         return detachAll(&cfg);
     } else if (std.mem.eql(u8, cmd, "kill") or std.mem.eql(u8, cmd, "k")) {
@@ -348,6 +393,10 @@ pub fn main() !void {
         if (command_args.items.len > 0) {
             command = command_args.items;
         }
+
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+
         var daemon = Daemon{
             .running = true,
             .cfg = &cfg,
@@ -357,6 +406,7 @@ pub fn main() !void {
             .socket_path = undefined,
             .pid = undefined,
             .command = command,
+            .cwd = cwd,
         };
         daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, session_name);
         std.log.info("socket path={s}", .{daemon.socket_path});
@@ -373,6 +423,10 @@ pub fn main() !void {
         }
 
         const clients = try std.ArrayList(*Client).initCapacity(alloc, 10);
+
+        var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const cwd = std.posix.getcwd(&cwd_buf) catch "";
+
         var daemon = Daemon{
             .running = true,
             .cfg = &cfg,
@@ -382,6 +436,7 @@ pub fn main() !void {
             .socket_path = undefined,
             .pid = undefined,
             .command = null,
+            .cwd = cwd,
         };
         daemon.socket_path = try getSocketPath(alloc, cfg.socket_dir, session_name);
         std.log.info("socket path={s}", .{daemon.socket_path});
@@ -394,7 +449,19 @@ pub fn main() !void {
 fn printVersion() !void {
     var buf: [256]u8 = undefined;
     var w = std.fs.File.stdout().writer(&buf);
-    try w.interface.print("zmx {s}\nghostty-vt {s}\n", .{ version, ghostty_version });
+    var ver = version;
+    if (builtin.mode == .Debug) {
+        ver = git_sha;
+    }
+    try w.interface.print("zmx {s}\nghostty-vt {s}\n", .{ ver, ghostty_version });
+    try w.interface.flush();
+}
+
+fn printCompletions(shell: completions.Shell) !void {
+    const script = shell.getCompletionScript();
+    var buf: [8192]u8 = undefined;
+    var w = std.fs.File.stdout().writer(&buf);
+    try w.interface.print("{s}\n", .{script});
     try w.interface.flush();
 }
 
@@ -408,7 +475,8 @@ fn help() !void {
         \\  [a]ttach <name> [command...]  Attach to session, creating session if needed
         \\  [r]un <name> [command...]     Send command without attaching, creating session if needed
         \\  [d]etach                      Detach all clients from current session (ctrl+\ for current client)
-        \\  [l]ist                        List active sessions
+        \\  [l]ist [--short]              List active sessions
+        \\  [c]ompletions <shell>         Completion scripts for shell integration (bash, zsh, or fish)
         \\  [k]ill <name>                 Kill a session and all attached clients
         \\  [hi]story <name> [--vt|--html] Output session scrollback (--vt or --html for escape sequences)
         \\  [v]ersion                     Show version information
@@ -427,13 +495,15 @@ const SessionEntry = struct {
     clients_len: ?usize,
     is_error: bool,
     error_name: ?[]const u8,
+    cmd: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
 
     fn lessThan(_: void, a: SessionEntry, b: SessionEntry) bool {
         return std.mem.order(u8, a.name, b.name) == .lt;
     }
 };
 
-fn list(cfg: *Cfg) !void {
+fn list(cfg: *Cfg, short: bool) !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const alloc = gpa.allocator();
@@ -448,6 +518,8 @@ fn list(cfg: *Cfg) !void {
     defer {
         for (sessions.items) |session| {
             alloc.free(session.name);
+            if (session.cmd) |cmd| alloc.free(cmd);
+            if (session.cwd) |cwd| alloc.free(cwd);
         }
         sessions.deinit(alloc);
     }
@@ -474,17 +546,30 @@ fn list(cfg: *Cfg) !void {
             };
             posix.close(result.fd);
 
+            // Extract cmd and cwd from the fixed-size arrays
+            const cmd: ?[]const u8 = if (result.info.cmd_len > 0)
+                alloc.dupe(u8, result.info.cmd[0..result.info.cmd_len]) catch null
+            else
+                null;
+            const cwd: ?[]const u8 = if (result.info.cwd_len > 0)
+                alloc.dupe(u8, result.info.cwd[0..result.info.cwd_len]) catch null
+            else
+                null;
+
             try sessions.append(alloc, .{
                 .name = name,
                 .pid = result.info.pid,
                 .clients_len = result.info.clients_len,
                 .is_error = false,
                 .error_name = null,
+                .cmd = cmd,
+                .cwd = cwd,
             });
         }
     }
 
     if (sessions.items.len == 0) {
+        if (short) return;
         try w.interface.print("no sessions found in {s}\n", .{cfg.socket_dir});
         try w.interface.flush();
         return;
@@ -493,10 +578,20 @@ fn list(cfg: *Cfg) !void {
     std.mem.sort(SessionEntry, sessions.items, {}, SessionEntry.lessThan);
 
     for (sessions.items) |session| {
-        if (session.is_error) {
+        if (short) {
+            if (session.is_error) continue;
+            try w.interface.print("{s}\n", .{session.name});
+        } else if (session.is_error) {
             try w.interface.print("session_name={s}\tstatus={s}\t(cleaning up)\n", .{ session.name, session.error_name.? });
         } else {
-            try w.interface.print("session_name={s}\tpid={d}\tclients={d}\n", .{ session.name, session.pid.?, session.clients_len.? });
+            try w.interface.print("session_name={s}\tpid={d}\tclients={d}", .{ session.name, session.pid.?, session.clients_len.? });
+            if (session.cwd) |cwd| {
+                try w.interface.print("\tstarted_in={s}", .{cwd});
+            }
+            if (session.cmd) |cmd| {
+                try w.interface.print("\tcmd={s}", .{cmd});
+            }
+            try w.interface.print("\n", .{});
         }
         try w.interface.flush();
     }
@@ -680,6 +775,7 @@ fn ensureSession(daemon: *Daemon) !EnsureSessionResult {
                 };
             }
             try daemonLoop(daemon, server_sock_fd, pty_fd);
+            daemon.handleKill();
             _ = posix.waitpid(daemon.pid, 0);
             daemon.deinit();
             return .{ .created = true, .is_daemon = true };
@@ -1007,7 +1103,7 @@ fn clientLoop(_: *Cfg, client_sock_fd: i32) !void {
 
 fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     std.log.info("daemon started session={s} pty_fd={d}", .{ daemon.session_name, pty_fd });
-    var should_exit = false;
+    setupSigtermHandler();
     var poll_fds = try std.ArrayList(posix.pollfd).initCapacity(daemon.alloc, 8);
     defer poll_fds.deinit(daemon.alloc);
 
@@ -1021,7 +1117,12 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
     var vt_stream = term.vtStream();
     defer vt_stream.deinit();
 
-    while (!should_exit and daemon.running) {
+    daemon_loop: while (daemon.running) {
+        if (sigterm_received.swap(false, .acq_rel)) {
+            std.log.info("SIGTERM received, shutting down gracefully session={s}", .{daemon.session_name});
+            break :daemon_loop;
+        }
+
         poll_fds.clearRetainingCapacity();
 
         try poll_fds.append(daemon.alloc, .{
@@ -1054,7 +1155,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
         if (poll_fds.items[0].revents & (posix.POLL.ERR | posix.POLL.HUP | posix.POLL.NVAL) != 0) {
             std.log.err("server socket error revents={d}", .{poll_fds.items[0].revents});
-            should_exit = true;
+            break :daemon_loop;
         } else if (poll_fds.items[0].revents & posix.POLL.IN != 0) {
             const client_fd = try posix.accept(server_sock_fd, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC);
             const client = try daemon.alloc.create(Client);
@@ -1081,7 +1182,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                 if (n == 0) {
                     // EOF: Shell exited
                     std.log.info("shell exited pty_fd={d}", .{pty_fd});
-                    should_exit = true;
+                    break :daemon_loop;
                 } else {
                     // Feed PTY output to terminal emulator for state tracking
                     try vt_stream.nextSlice(buf[0..n]);
@@ -1119,14 +1220,14 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     if (err == error.WouldBlock) continue;
                     std.log.debug("client read err={s} fd={d}", .{ @errorName(err), client.socket_fd });
                     const last = daemon.closeClient(client, i, false);
-                    if (last) should_exit = true;
+                    if (last) break :daemon_loop;
                     continue;
                 };
 
                 if (n == 0) {
                     // Client closed connection
                     const last = daemon.closeClient(client, i, false);
-                    if (last) should_exit = true;
+                    if (last) break :daemon_loop;
                     continue;
                 }
 
@@ -1144,9 +1245,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                             break :clients_loop;
                         },
                         .Kill => {
-                            daemon.handleKill();
-                            should_exit = true;
-                            break :clients_loop;
+                            break :daemon_loop;
                         },
                         .Info => try daemon.handleInfo(client),
                         .History => try daemon.handleHistory(client, &term, msg.payload),
@@ -1162,7 +1261,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
                     if (err == error.WouldBlock) break :blk 0;
                     // Error on write, close client
                     const last = daemon.closeClient(client, i, false);
-                    if (last) should_exit = true;
+                    if (last) break :daemon_loop;
                     continue;
                 };
 
@@ -1177,7 +1276,7 @@ fn daemonLoop(daemon: *Daemon, server_sock_fd: i32, pty_fd: i32) !void {
 
             if (revents & (posix.POLL.HUP | posix.POLL.ERR | posix.POLL.NVAL) != 0) {
                 const last = daemon.closeClient(client, i, false);
-                if (last) should_exit = true;
+                if (last) break :daemon_loop;
             }
         }
     }
@@ -1334,6 +1433,10 @@ fn handleSigwinch(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c
     sigwinch_received.store(true, .release);
 }
 
+fn handleSigterm(_: i32, _: *const posix.siginfo_t, _: ?*anyopaque) callconv(.c) void {
+    sigterm_received.store(true, .release);
+}
+
 fn setupSigwinchHandler() void {
     const act: posix.Sigaction = .{
         .handler = .{ .sigaction = handleSigwinch },
@@ -1341,6 +1444,15 @@ fn setupSigwinchHandler() void {
         .flags = posix.SA.SIGINFO,
     };
     posix.sigaction(posix.SIG.WINCH, &act, null);
+}
+
+fn setupSigtermHandler() void {
+    const act: posix.Sigaction = .{
+        .handler = .{ .sigaction = handleSigterm },
+        .mask = posix.sigemptyset(),
+        .flags = posix.SA.SIGINFO,
+    };
+    posix.sigaction(posix.SIG.TERM, &act, null);
 }
 
 fn getTerminalSize(fd: i32) ipc.Resize {
